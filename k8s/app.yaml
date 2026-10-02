@@ -1,0 +1,178 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openrideshare
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openrideshare-config
+  namespace: openrideshare
+data:
+  OSRM_URL: "https://router.project-osrm.org"
+  WAZE_FEED_URL: ""
+  LOCAL_WAGE_CENTS_PER_HOUR: "2500"
+  USERS_PER_POD: "500"
+  POD_MONTHLY_COST_CENTS: "5000"
+  RIDES_PER_USER_MONTH: "4"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openrideshare-api
+  namespace: openrideshare
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: openrideshare-api
+  template:
+    metadata:
+      labels:
+        app: openrideshare-api
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: openrideshare-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: openrideshare-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: openrideshare-secrets
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: openrideshare-secrets
+                  key: jwt-secret
+            - name: INVITATION_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openrideshare-secrets
+                  key: invitation-admin-key
+            - name: WAZE_FEED_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: openrideshare-secrets
+                  key: waze-feed-token
+                  optional: true
+            - name: VENMO_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: openrideshare-secrets
+                  key: venmo-username
+                  optional: true
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openrideshare-api
+  namespace: openrideshare
+spec:
+  selector:
+    app: openrideshare-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: openrideshare-api
+  namespace: openrideshare
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: openrideshare-api
+  minReplicas: 2
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openrideshare-api
+  namespace: openrideshare
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["api.openrideshare.example"]
+      secretName: openrideshare-tls
+  rules:
+    - host: api.openrideshare.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: openrideshare-api
+                port:
+                  number: 80
